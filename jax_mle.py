@@ -1,134 +1,115 @@
 import jax
 import jax.numpy as jnp
-from jax import grad, jit, vmap
-from jax.scipy.stats import norm  # norm.cdf, .pdf
+from jax.scipy.stats import norm, binom
 import numpy as np
-from scipy.optimize import minimize  # alt to jax
-from numpy.polynomial.hermite import hermgauss  # Gauss-Hermite quadrature
+from numpy.polynomial.hermite import hermgauss
+from jax.scipy.optimize import minimize
 
-
-def cond_default_prob_gc(p, m_pd, x):
-    """
-    One factor Gaussian copula model
-    Returns P(D=d | X=x)
-    """
-    inv_norm_m_pd = norm.ppf(m_pd)  # quantile fc - PD marginals
-    denom = jnp.sqrt(1 - p**2)  
-    arg = (inv_norm_m_pd - p * x) / denom
-    return norm.cdf(arg)
-
-
-
-def likelihood_given_x(d, p_vec, m_pd_vec, x):   
-    """
-    Likelihood given x
-    Returns P(D=d | X=x)
-    """
-    cond_probs = jnp.array([cond_default_prob_gc(p_vec[k], m_pd_vec[k], x) for k in range(len(d))])
-    # for each cluster: if d[k]==1, mult by cond_probs[k]; otherwise by (1-cond_probs[k])
-    likelihood = jnp.prod(jnp.where(d==1, cond_probs, 1-cond_probs))
-    return likelihood
-
-
-def gauss_hermite_integral(f, deg=50):
-    """
-    Approximate integral f(x) phi(x) dx using Gauss-Hermite quadrature.
-    """
+#  Gauss-Hermite Quadrature 
+def get_gh_nodes_weights(deg=50):
     nodes, weights = hermgauss(deg)
-    # nodes are roots of Hermite polynomial, weights are for integral f(x) e^{-x^2} dx
-
-    # But phi(x) = (1/sqrt(2pi)) e^{-x^2/2}. So we need to adjust.
-    # Actually, Gauss-Hermite quadrature gives integral f(x) e^{-x^2} dx approx sum w_i f(x_i).
-    # For phi(x) = e^{-x^2/2} / sqrt(2pi), we set f(x) = g(x) * e^{-x^2/2}? 
-
-    # Easier:
-    # integral g(x) phi(x) dx = (1/sqrt(2pi)) integral g(x) e^{-x^2/2} dx.
-
-    # notation must be updated, can be a bit confusing - maybe I will put in md in the notebook
-
-    # Change variable: let y = x/sqrt(2), then e^{-x^2/2} = e^{-y^2} and dx = sqrt(2) dy.
-    # Then integral g(x) phi(x) dx = (1/sqrt(pi)) integral g(sqrt(2) y) e^{-y^2} dy.
-    # Gauss-Hermite quadrature directly approximates integral h(y) e^{-y^2} dy approx sum w_i h(y_i).
-    # So we can use nodes_y = nodes / sqrt(2), and weights = weights / sqrt(pi).
-
-    nodes_y = nodes * jnp.sqrt(2)
-    weights_adj = weights / jnp.sqrt(jnp.pi)
-    return jnp.sum(weights_adj * f(nodes_y))
-
-# Precompute Gauss-Hermite nodes and weights for standard normal phi(x)
-def gauss_hermite_std_normal(deg):
-    nodes, weights = hermgauss(deg)
-    # Transform to N(0,1): nodes_std = nodes * sqrt(2)
-    # Because original nodes are for integral f(x) e^{-x^2} dx.
-    # We want integral f(x) phi(x) dx with phi(x)=e^{-x^2/2}/sqrt(2pi).
-    # Using substitution z = x/sqrt(2), we get integral f(sqrt(2) z) e^{-z^2} dz / sqrt(pi).
-    # Then Gauss-Hermite gives sum w_i f(sqrt(2) z_i) / sqrt(pi).
     nodes_std = nodes * np.sqrt(2.0)
     weights_std = weights / np.sqrt(np.pi)
-    return nodes_std, weights_std
+    return jnp.array(nodes_std), jnp.array(weights_std)
 
-nodes, weights = gauss_hermite_std_normal(50) 
-nodes = jnp.array(nodes)
-weights = jnp.array(weights)
+nodes, weights = get_gh_nodes_weights(50)
 
-def marginal_likelihood_one(d, p_vec, m_pd_vec): #marginal likelihood for one cluster
+#  Conditional Default Probability 
+def cond_default_prob(rho, pd, x):
     """
-    Returns P(D=d) = integral P(D=d|x) phi(x) dx
+    rho: asset correlation in [0,1]
+    pd: marginal default probability
+    x: systemic factor
     """
-    def integrand(g):
-        return likelihood_given_x(d, p_vec, m_pd_vec, g)
-    # Quadrature sum
-    # vmap to evaluate integrand at all nodes simultaneously
-    vals = jax.vmap(integrand)(nodes)   # shape (deg,)
-    return jnp.sum(weights * vals)    
+    rho = jnp.clip(rho, 1e-6, 1 - 1e-6)
+    inv = norm.ppf(pd)
+    arg = (inv - jnp.sqrt(rho) * x) / jnp.sqrt(1 - rho)
+    return norm.cdf(arg)
 
+#  Log-Likelihood Given X (log-space for numerical stability)
+def log_likelihood_given_x(d, n, rho_vec, pd_vec, x):
+    """
+    Log-likelihood of observing default counts d out of n obligors,
+    given systemic factor x and asset correlations rho_vec.
+    Uses binom.logpmf to avoid underflow with large n.
+    """
+    probs = jnp.array([cond_default_prob(rho_vec[k], pd_vec[k], x) for k in range(len(d))])
+    probs = jnp.clip(probs, 1e-6, 1 - 1e-6)
+    log_pmfs = binom.logpmf(d, n, probs)
+    # Cap at -500 to prevent -inf which causes NaN gradients
+    return jnp.sum(jnp.maximum(log_pmfs, -500.0))
 
-def log_likelihood(p_vec, D, m_pd_vec): # log-likelihood for the whole dataset
+#  Log-Marginal Likelihood (Integrated over X via log-sum-exp)
+def log_marginal_likelihood(d, n, rho_vec, pd_vec):
     """
-    p_vec: vector of factor loadings (K,)
-    D: array of defaults (N, K)
-    m_pd_vec: marginal default probs (K,)
-    Returns total log-likelihood (scalar)
+    log P(d | rho) = log ∫ P(d|x,rho) phi(x) dx
+    Evaluated via Gauss-Hermite quadrature with log-sum-exp trick.
     """
-    N = D.shape[0]
-    # marginal likelihood for each observation
-    def log_lik_one(d):
-        return jnp.log(marginal_likelihood_one(d, p_vec, m_pd_vec) + 1e-12) # to avoid log(0)
-    log_like_vals = jax.vmap(log_lik_one)(D) # shape (N,)
-    return jnp.sum(log_like_vals)
+    def log_integrand(x):
+        return log_likelihood_given_x(d, n, rho_vec, pd_vec, x)
+    log_vals = jax.vmap(log_integrand)(nodes)  # (deg,)
+    # log-sum-exp: log( sum w_i * exp(log_val_i) )
+    log_weights = jnp.log(weights)
+    return jax.scipy.special.logsumexp(log_vals + log_weights)
 
+#  Log-Likelihood 
+def log_likelihood(rho_vec, D, N_obligors, pd_vec):
+    """
+    Total log-likelihood over all observations.
+    D: (N, K) array of default counts
+    N_obligors: (N, K) array of obligor counts
+    rho_vec: (K,) asset correlations
+    pd_vec: (K,) marginal PDs
+    """
+    def log_lik_one(d, n):
+        return log_marginal_likelihood(d, n, rho_vec, pd_vec)
+    log_likes = jax.vmap(log_lik_one)(D, N_obligors)
+    return jnp.sum(log_likes)
 
-def fit_factor_loadings_gd(D, m_pd_vec, init_p=None, lr=0.01, steps=10000):
-    """
-    Fit factor loadings via gradient descent on negative log-likelihood.
-    """
+# Sigmoid reparameterization: ρ = sigmoid(θ) to enforce ρ ∈ (0, 1) during unconstrained optimization
+def _rho_to_theta(rho):
+    """Map ρ ∈ (0,1) → θ ∈ ℝ  (logit)"""
+    rho = jnp.clip(rho, 1e-6, 1 - 1e-6)
+    return jnp.log(rho / (1 - rho))
+
+def _theta_to_rho(theta):
+    """Map θ ∈ ℝ → ρ ∈ (0,1)  (sigmoid)"""
+    return jax.nn.sigmoid(theta)
+
+#  BFGS (with sigmoid reparameterization)
+def fit_rho_bfgs(D, N_obligors, pd_vec, init_rho=None):
     K = D.shape[1]
-    if init_p is None:
-        init_p = jnp.zeros(K) + 0.3
+    if init_rho is None:
+        init_rho = jnp.full(K, 0.1)
 
-    loss_fn = lambda p: -log_likelihood(p, D, m_pd_vec)
-    grad_loss = jax.grad(loss_fn)
+    init_theta = _rho_to_theta(init_rho)
 
-    p_vec = init_p.copy()
+    def loss(theta):
+        rho = _theta_to_rho(theta)
+        return -log_likelihood(rho, D, N_obligors, pd_vec)
+
+    result = minimize(loss, init_theta, method='BFGS')
+    return _theta_to_rho(result.x)
+
+#  Gradient Descent
+def fit_rho_gd(D, N_obligors, pd_vec, init_rho=None, lr=0.01, steps=1000):
+    K = D.shape[1]
+    if init_rho is None:
+        init_rho = jnp.full(K, 0.1)
+
+    init_theta = _rho_to_theta(init_rho)
+
+    def loss(theta):
+        rho = _theta_to_rho(theta)
+        return -log_likelihood(rho, D, N_obligors, pd_vec)
+
+    grad_loss = jax.grad(loss)
+    theta = init_theta.copy()
+
     for i in range(steps):
-        gl = grad_loss(p_vec)
-        p_vec = p_vec - lr * gl
-        p_vec = jnp.clip(p_vec, -0.99, 0.99)
+        g = grad_loss(theta)
+        theta = theta - lr * g
         if i % 100 == 0:
-            print(f'Step {i}, loss = {loss_fn(p_vec):.4f}')
-    return p_vec
+            print(f"Step {i}, loss = {loss(theta):.4f}, rho = {_theta_to_rho(theta)}")
 
-
-def fit_factor_loadings_bfgs(D, m_pd_vec, init_p=None):
-    """
-    Fit factor loadings via L-BFGS from JAX.
-    """
-    from jax.scipy.optimize import minimize as jax_minimize
-
-    K = D.shape[1]
-    if init_p is None:
-        init_p = jnp.zeros(K) + 0.3
-
-    loss_fn = lambda p: -log_likelihood(p, D, m_pd_vec)
-    result = jax_minimize(loss_fn, init_p, method='BFGS')
-    return result.x
+    return _theta_to_rho(theta)

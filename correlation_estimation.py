@@ -178,5 +178,5 @@ def compare_methods(grades, pds, ts_var_by_grade):
 
     return {
         m: estimate_asset_correlations(grades, pds, ts_var_by_grade, method=m)
-        for m in ("bisection", "newton", "quadrature")
+        for m in ("brent", "newton", "quadrature")
     }
